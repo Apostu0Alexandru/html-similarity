@@ -11,18 +11,71 @@ import time
 import json
 import logging
 import hashlib
-from PIL import Image, ImageDraw
+from PIL import Image
 from io import BytesIO
 from collections import Counter
 import cssutils
 import colorsys
 import requests
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
+import base64
+from playwright.sync_api import sync_playwright
 
 # Suppress cssutils logging
 cssutils.log.setLevel(logging.FATAL)
+
+# TwelveLabs API client
+class TwelveLabs:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://api.twelvelabs.io/v1.3"
+        self.embed = self.Embed(api_key, self.base_url)
+    
+    class Embed:
+        def __init__(self, api_key, base_url):
+            self.api_key = api_key
+            self.base_url = base_url
+        
+        def create(self, model_name, image_base64=None, image_url=None):
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"
+            }
+            
+            payload = {
+                "model_name": model_name
+            }
+            
+            if image_base64:
+                payload["image_base64"] = image_base64
+            elif image_url:
+                payload["image_url"] = image_url
+            
+            response = requests.post(
+                f"{self.base_url}/embed",
+                headers=headers,
+                json=payload
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Create a response object with expected structure
+                class EmbedResponse:
+                    class ImageEmbedding:
+                        class Segments:
+                            def __init__(self, embeddings_float):
+                                self.embeddings_float = embeddings_float
+                        
+                        def __init__(self, segments_data):
+                            self.segments = self.Segments(segments_data["embeddings_float"])
+                    
+                    def __init__(self, data):
+                        self.image_embedding = self.ImageEmbedding(data["image_embedding"]["segments"])
+                
+                return EmbedResponse(data)
+            else:
+                raise Exception(f"API error: {response.status_code}, {response.text}")
+
 
 class EnhancedHTMLSimilarityAnalyzer:
     """
@@ -41,7 +94,7 @@ class EnhancedHTMLSimilarityAnalyzer:
             visual_weight: Weight for visual appearance similarity (default: 0.4)
             semantic_weight: Weight for semantic element similarity (default: 0.1)
             threshold: Similarity threshold for grouping documents (default: 0.75)
-            render_screenshots: Whether to render actual screenshots using Selenium (default: False)
+            render_screenshots: Whether to render actual screenshots using Playwright (default: False)
         """
         self.content_weight = content_weight
         self.structure_weight = structure_weight
@@ -51,18 +104,10 @@ class EnhancedHTMLSimilarityAnalyzer:
         self.render_screenshots = render_screenshots
         self.vectorizer = TfidfVectorizer(stop_words='english')
         
-        # Initialize browser if rendering screenshots
+        # Initialize playwright if rendering screenshots
         if self.render_screenshots:
-            self._init_browser()
-    
-    def _init_browser(self):
-        """Initialize headless browser for rendering screenshots."""
-        chrome_options = Options()
-        chrome_options.add_argument("--headless")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--window-size=1280,1024")
-        self.browser = webdriver.Chrome(ChromeDriverManager().install(), options=chrome_options)
+            self.playwright = sync_playwright().start()
+            self.browser = self.playwright.chromium.launch(headless=True)
     
     def extract_features(self, html_files, directory):
         """
@@ -430,7 +475,7 @@ class EnhancedHTMLSimilarityAnalyzer:
             Visual fingerprint as a list
         """
         if self.render_screenshots:
-            # Use actual screenshots with Selenium
+            # Use actual screenshots with Playwright
             return self._generate_screenshot_fingerprint(html_content)
         else:
             # Fall back to a DOM-based visual fingerprint
@@ -453,20 +498,26 @@ class EnhancedHTMLSimilarityAnalyzer:
         
         # Get absolute path for the file URL
         file_path = os.path.abspath(tmp_file)
-        file_url = f"file:///{file_path}"
+        file_url = f"file://{file_path}"
+        
+        # Create a new page
+        page = self.browser.new_page(viewport={"width": 1280, "height": 1024})
         
         # Load the page
-        self.browser.get(file_url)
-        time.sleep(1)  # Wait for rendering
+        page.goto(file_url)
+        page.wait_for_load_state("networkidle")
         
         # Take screenshot
-        screenshot = self.browser.get_screenshot_as_png()
+        screenshot_bytes = page.screenshot()
+        
+        # Close the page
+        page.close()
         
         # Clean up
         os.remove(tmp_file)
         
         # Process screenshot
-        image = Image.open(BytesIO(screenshot))
+        image = Image.open(BytesIO(screenshot_bytes))
         # Resize to a smaller dimension for faster processing
         image = image.resize((100, 100))
         # Convert to grayscale
@@ -1171,17 +1222,326 @@ class EnhancedHTMLSimilarityAnalyzer:
         return groups, similarity_matrix, html_files
     
     def cleanup(self):
-        """Close browser if it was initialized."""
-        if self.render_screenshots and hasattr(self, 'browser'):
-            self.browser.quit()
+        """Close Playwright resources if initialized."""
+        if self.render_screenshots:
+            self.browser.close()
+            self.playwright.stop()
+
+
+class ScreenshotSimilarityAnalyzer:
+    """
+    Analyze HTML similarity by comparing screenshots using the Twelve Labs image embedding API.
+    """
+    
+    def __init__(self, api_key, threshold=0.75):
+        """
+        Initialize the analyzer with Twelve Labs API access and similarity threshold.
+        
+        Args:
+            api_key: Twelve Labs API key
+            threshold: Similarity threshold for grouping documents (default: 0.75)
+        """
+        self.api_key = api_key
+        self.threshold = threshold
+        self.twelvelabs_client = TwelveLabs(api_key=api_key)
+        self._init_browser()
+    
+    def _init_browser(self):
+        """Initialize Playwright for taking screenshots."""
+        self.playwright = sync_playwright().start()
+        self.browser = self.playwright.chromium.launch(headless=True)
+    
+    def capture_screenshot(self, html_path):
+        """
+        Capture screenshot of an HTML file using Playwright.
+        
+        Args:
+            html_path: Path to the HTML file
+            
+        Returns:
+            PIL Image object
+        """
+        try:
+            # Get absolute path for file URL
+            file_path = os.path.abspath(html_path)
+            file_url = f"file://{file_path}"
+            
+            # Create a new page
+            page = self.browser.new_page(viewport={"width": 1280, "height": 1024})
+            
+            # Load the page
+            page.goto(file_url)
+            page.wait_for_load_state("networkidle")
+            
+            # Take screenshot
+            screenshot_bytes = page.screenshot()
+            
+            # Close the page
+            page.close()
+            
+            # Convert to PIL Image
+            image = Image.open(BytesIO(screenshot_bytes))
+            
+            return image
+        except Exception as e:
+            print(f"Error capturing screenshot for {html_path}: {e}")
+            return None
+    
+    def get_image_embedding(self, image):
+        """
+        Get embedding for an image using Twelve Labs API.
+        
+        Args:
+            image: PIL Image object
+            
+        Returns:
+            Embedding vector
+        """
+        try:
+            # Convert image to base64 string
+            buffered = BytesIO()
+            image.save(buffered, format="JPEG")
+            img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+            
+            # Generate embedding using Twelve Labs API
+            response = self.twelvelabs_client.embed.create(
+                model_name="Marengo-retrieval-2.7",
+                image_base64=img_base64
+            )
+            
+            # Extract the embedding vector
+            embedding = response.image_embedding.segments.embeddings_float
+            
+            return embedding
+        except Exception as e:
+            print(f"Error getting image embedding: {e}")
+            return None
+    
+    def analyze_directory(self, directory):
+        """
+        Analyze all HTML files in a directory and group similar documents.
+        
+        Args:
+            directory: Directory containing HTML files
+            
+        Returns:
+            List of lists containing grouped document names, similarity matrix, and file names
+        """
+        # Get all HTML files in the directory
+        html_files = [f for f in os.listdir(directory) if f.endswith('.html')]
+        
+        if not html_files:
+            print(f"No HTML files found in {directory}")
+            return [], None, []
+        
+        print(f"Found {len(html_files)} HTML files in {directory}")
+        
+        # Get embeddings for all HTML files
+        print("Capturing screenshots and generating embeddings...")
+        embeddings = []
+        valid_files = []
+        
+        for html_file in html_files:
+            html_path = os.path.join(directory, html_file)
+            print(f"Processing {html_file}...")
+            
+            # Capture screenshot
+            screenshot = self.capture_screenshot(html_path)
+            
+            if screenshot:
+                # Get embedding
+                embedding = self.get_image_embedding(screenshot)
+                
+                if embedding:
+                    embeddings.append(embedding)
+                    valid_files.append(html_file)
+                else:
+                    print(f"Failed to get embedding for {html_file}")
+            else:
+                print(f"Failed to capture screenshot for {html_file}")
+        
+        if not embeddings:
+            print("No valid embeddings generated")
+            return [], None, []
+        
+        # Compute similarity matrix
+        print("Computing similarity matrix...")
+        embeddings_array = np.array(embeddings)
+        similarity_matrix = cosine_similarity(embeddings_array)
+        
+        # Group similar documents
+        print(f"Grouping documents with similarity threshold {self.threshold}...")
+        grouped = self._group_similar_documents(similarity_matrix, valid_files)
+        
+        return grouped, similarity_matrix, valid_files
+    
+    def _group_similar_documents(self, similarity_matrix, file_names):
+        """
+        Group similar documents based on similarity matrix.
+        
+        Args:
+            similarity_matrix: Matrix of similarity scores
+            file_names: List of file names
+            
+        Returns:
+            List of lists containing grouped document names
+        """
+        n = len(file_names)
+        grouped = []
+        processed = set()
+        
+        for i in range(n):
+            if i in processed:
+                continue
+            
+            group = [file_names[i]]
+            processed.add(i)
+            
+            for j in range(i+1, n):
+                if j not in processed and similarity_matrix[i, j] >= self.threshold:
+                    group.append(file_names[j])
+                    processed.add(j)
+            
+            grouped.append(group)
+        
+        print(f"Found {len(grouped)} groups of similar documents.")
+        return grouped
+    
+    def cleanup(self):
+        """Close Playwright resources."""
+        if hasattr(self, 'browser'):
+            self.browser.close()
+        if hasattr(self, 'playwright'):
+            self.playwright.stop()
+
+
+class HtmlSimilarityOrchestrator:
+    """
+    Orchestrate multiple HTML similarity analysis approaches.
+    """
+    
+    def __init__(self, method="hybrid", twelve_labs_api_key=None, **kwargs):
+        """
+        Initialize the orchestrator with the desired method.
+        
+        Args:
+            method: Analysis method to use - "weighted", "visual", or "hybrid" (default: "hybrid")
+            twelve_labs_api_key: API key for Twelve Labs (required for "visual" and "hybrid" methods)
+            **kwargs: Additional arguments to pass to analyzers
+        """
+        self.method = method
+        
+        # Initialize analyzers based on method
+        if method == "weighted" or method == "hybrid":
+            self.weighted_analyzer = EnhancedHTMLSimilarityAnalyzer(**kwargs)
+        
+        if method == "visual" or method == "hybrid":
+            if not twelve_labs_api_key:
+                raise ValueError("Twelve Labs API key is required for visual or hybrid analysis")
+            self.visual_analyzer = ScreenshotSimilarityAnalyzer(
+                api_key=twelve_labs_api_key,
+                threshold=kwargs.get("threshold", 0.75)
+            )
+    
+    def analyze_directory(self, directory):
+        """
+        Analyze all HTML files in a directory using the selected method.
+        
+        Args:
+            directory: Directory containing HTML files
+            
+        Returns:
+            List of lists containing grouped document names, similarity matrix, and file names
+        """
+        if self.method == "weighted":
+            return self.weighted_analyzer.analyze_directory(directory)
+        
+        elif self.method == "visual":
+            return self.visual_analyzer.analyze_directory(directory)
+        
+        else:  # hybrid
+            # Run both analysis methods
+            print("\n=== Running weighted analysis ===")
+            weighted_groups, weighted_matrix, weighted_files = self.weighted_analyzer.analyze_directory(directory)
+            
+            print("\n=== Running visual screenshot-based analysis ===")
+            visual_groups, visual_matrix, visual_files = self.visual_analyzer.analyze_directory(directory)
+            
+            # Combine results
+            print("\n=== Combining results from both methods ===")
+            combined_groups = self._combine_groups(weighted_groups, visual_groups)
+            
+            return combined_groups, None, weighted_files
+    
+    def _combine_groups(self, weighted_groups, visual_groups):
+        """
+        Combine grouping results from multiple analysis methods.
+        
+        Args:
+            weighted_groups: Groups from weighted analysis
+            visual_groups: Groups from visual analysis
+            
+        Returns:
+            Combined groups
+        """
+        # Start with visual groups as the base
+        combined = visual_groups.copy()
+        
+        # For each weighted group
+        for w_group in weighted_groups:
+            # If all files in this group exist in the same visual group, skip
+            if self._group_exists_in(w_group, combined):
+                continue
+            
+            # Otherwise, look for partial matches and enhance
+            matched = False
+            for c_group in combined:
+                if self._groups_overlap(w_group, c_group):
+                    # If there's significant overlap, merge non-overlapping elements
+                    for file in w_group:
+                        if file not in c_group:
+                            c_group.append(file)
+                    matched = True
+            
+            # If no match found at all, add as a new group
+            if not matched and w_group:
+                combined.append(w_group)
+        
+        return combined
+    
+    def _group_exists_in(self, group, group_list):
+        """Check if all elements of a group exist in any single group in the list."""
+        for g in group_list:
+            if all(item in g for item in group):
+                return True
+        return False
+    
+    def _groups_overlap(self, group1, group2, threshold=0.5):
+        """Check if two groups have significant overlap."""
+        if not group1 or not group2:
+            return False
+            
+        common = [item for item in group1 if item in group2]
+        return len(common) / min(len(group1), len(group2)) >= threshold
+    
+    def cleanup(self):
+        """Clean up resources."""
+        if hasattr(self, 'weighted_analyzer'):
+            self.weighted_analyzer.cleanup()
+        
+        if hasattr(self, 'visual_analyzer'):
+            self.visual_analyzer.cleanup()
 
 
 def main():
     """
-    Main function to run the HTML similarity analyzer.
+    Main function to run the orchestrated HTML similarity analyzer.
     """
-    parser = argparse.ArgumentParser(description='Group similar HTML documents from a user perspective')
+    parser = argparse.ArgumentParser(description='Group similar HTML documents using multiple approaches')
     parser.add_argument('directory', help='Directory containing HTML files')
+    parser.add_argument('--method', choices=['weighted', 'visual', 'hybrid'], default='hybrid',
+                        help='Analysis method to use (default: hybrid)')
+    parser.add_argument('--api-key', help='Twelve Labs API key (required for visual and hybrid methods)')
     parser.add_argument('--content-weight', type=float, default=0.3,
                         help='Weight for content-based similarity (default: 0.3)')
     parser.add_argument('--structure-weight', type=float, default=0.2,
@@ -1193,15 +1553,21 @@ def main():
     parser.add_argument('--threshold', type=float, default=0.75,
                         help='Similarity threshold for grouping documents (default: 0.75)')
     parser.add_argument('--render-screenshots', action='store_true',
-                        help='Render actual screenshots for visual comparison (slower but more accurate)')
+                        help='Render actual screenshots for visual comparison in weighted analysis')
     parser.add_argument('--visualize', action='store_true',
                         help='Visualize similarity matrix')
     parser.add_argument('--output', help='Output JSON file path')
     
     args = parser.parse_args()
     
-    # Create analyzer
-    analyzer = EnhancedHTMLSimilarityAnalyzer(
+    # Check if API key is provided for visual or hybrid methods
+    if args.method in ['visual', 'hybrid'] and not args.api_key:
+        parser.error("Twelve Labs API key is required for visual or hybrid analysis")
+    
+    # Create orchestrator
+    orchestrator = HtmlSimilarityOrchestrator(
+        method=args.method,
+        twelve_labs_api_key=args.api_key,
         content_weight=args.content_weight,
         structure_weight=args.structure_weight,
         visual_weight=args.visual_weight,
@@ -1221,7 +1587,7 @@ def main():
             
             for subdir in subdirs:
                 print(f"\nProcessing subdirectory: {subdir}")
-                groups, similarity_matrix, html_files = analyzer.analyze_directory(subdir)
+                groups, similarity_matrix, html_files = orchestrator.analyze_directory(subdir)
                 
                 print(f"Results for {subdir}:")
                 for i, group in enumerate(groups):
@@ -1229,14 +1595,15 @@ def main():
                 
                 all_results[subdir.name] = [group for group in groups]
                 
-                if args.visualize and similarity_matrix is not None:
+                if args.visualize and similarity_matrix is not None and args.method != "hybrid":
                     output_path = None
                     if args.output:
                         vis_dir = Path(args.output).parent / 'visualizations'
                         os.makedirs(vis_dir, exist_ok=True)
-                        output_path = vis_dir / f"{subdir.name}_similarity.png"
+                        output_path = vis_dir / f"{subdir.name}_{args.method}_similarity.png"
                     
-                    analyzer.visualize_similarity_matrix(similarity_matrix, html_files, output_path)
+                    if args.method == "weighted":
+                        orchestrator.weighted_analyzer.visualize_similarity_matrix(similarity_matrix, html_files, output_path)
             
             # Save results to JSON if output is specified
             if args.output:
@@ -1246,20 +1613,21 @@ def main():
         
         else:
             # Process the directory directly
-            groups, similarity_matrix, html_files = analyzer.analyze_directory(args.directory)
+            groups, similarity_matrix, html_files = orchestrator.analyze_directory(args.directory)
             
             print("\nFinal results:")
             for i, group in enumerate(groups):
                 print(f"Group {i+1}: {group}")
             
-            if args.visualize and similarity_matrix is not None:
+            if args.visualize and similarity_matrix is not None and args.method != "hybrid":
                 output_path = None
                 if args.output:
                     vis_dir = Path(args.output).parent / 'visualizations'
                     os.makedirs(vis_dir, exist_ok=True)
-                    output_path = vis_dir / "similarity.png"
+                    output_path = vis_dir / f"{args.method}_similarity.png"
                 
-                analyzer.visualize_similarity_matrix(similarity_matrix, html_files, output_path)
+                if args.method == "weighted":
+                    orchestrator.weighted_analyzer.visualize_similarity_matrix(similarity_matrix, html_files, output_path)
             
             # Save results to JSON if output is specified
             if args.output:
@@ -1269,7 +1637,7 @@ def main():
     
     finally:
         # Cleanup
-        analyzer.cleanup()
+        orchestrator.cleanup()
 
 
 if __name__ == "__main__":
