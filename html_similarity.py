@@ -11,80 +11,26 @@ import time
 import json
 import logging
 import hashlib
-from PIL import Image
+from PIL import Image, ImageDraw, ImageStat
 from io import BytesIO
 from collections import Counter
 import cssutils
 import colorsys
-import requests
-import base64
 from playwright.sync_api import sync_playwright
+import cv2
+import imagehash
 
 # Suppress cssutils logging
 cssutils.log.setLevel(logging.FATAL)
 
-# TwelveLabs API client
-class TwelveLabs:
-    def __init__(self, api_key):
-        self.api_key = api_key
-        self.base_url = "https://api.twelvelabs.io/v1.3"
-        self.embed = self.Embed(api_key, self.base_url)
-    
-    class Embed:
-        def __init__(self, api_key, base_url):
-            self.api_key = api_key
-            self.base_url = base_url
-        
-        def create(self, model_name, image_base64=None, image_url=None):
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}"
-            }
-            
-            payload = {
-                "model_name": model_name
-            }
-            
-            if image_base64:
-                payload["image_base64"] = image_base64
-            elif image_url:
-                payload["image_url"] = image_url
-            
-            response = requests.post(
-                f"{self.base_url}/embed",
-                headers=headers,
-                json=payload
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                # Create a response object with expected structure
-                class EmbedResponse:
-                    class ImageEmbedding:
-                        class Segments:
-                            def __init__(self, embeddings_float):
-                                self.embeddings_float = embeddings_float
-                        
-                        def __init__(self, segments_data):
-                            self.segments = self.Segments(segments_data["embeddings_float"])
-                    
-                    def __init__(self, data):
-                        self.image_embedding = self.ImageEmbedding(data["image_embedding"]["segments"])
-                
-                return EmbedResponse(data)
-            else:
-                raise Exception(f"API error: {response.status_code}, {response.text}")
-
-
-class EnhancedHTMLSimilarityAnalyzer:
+class HTMLSimilarityAnalyzer:
     """
-    An enhanced analyzer to group similar HTML documents based on multiple similarity metrics
-    that consider how users perceive web pages in a browser.
+    A comprehensive analyzer that groups similar HTML documents based on multiple similarity metrics.
+    Uses local screenshot analysis rather than external API services.
     """
     
     def __init__(self, content_weight=0.3, structure_weight=0.2, visual_weight=0.4, 
-                 semantic_weight=0.1, threshold=0.75, render_screenshots=False):
+                 semantic_weight=0.1, threshold=0.75, method="weighted", capture_screenshots=False):
         """
         Initialize the analyzer with weights for different similarity components.
         
@@ -94,18 +40,20 @@ class EnhancedHTMLSimilarityAnalyzer:
             visual_weight: Weight for visual appearance similarity (default: 0.4)
             semantic_weight: Weight for semantic element similarity (default: 0.1)
             threshold: Similarity threshold for grouping documents (default: 0.75)
-            render_screenshots: Whether to render actual screenshots using Playwright (default: False)
+            method: Analysis method to use - "weighted", "visual", or "hybrid" (default: "weighted")
+            capture_screenshots: Whether to capture and analyze actual screenshots (default: False)
         """
         self.content_weight = content_weight
         self.structure_weight = structure_weight
         self.visual_weight = visual_weight
         self.semantic_weight = semantic_weight
         self.threshold = threshold
-        self.render_screenshots = render_screenshots
+        self.method = method
+        self.capture_screenshots = capture_screenshots
         self.vectorizer = TfidfVectorizer(stop_words='english')
         
-        # Initialize playwright if rendering screenshots
-        if self.render_screenshots:
+        # Initialize playwright if capturing screenshots
+        if self.capture_screenshots:
             self.playwright = sync_playwright().start()
             self.browser = self.playwright.chromium.launch(headless=True)
     
@@ -131,7 +79,8 @@ class EnhancedHTMLSimilarityAnalyzer:
             'color_schemes': [],
             'semantic_structures': [],
             'visual_fingerprints': [],
-            'above_fold_content': []
+            'above_fold_content': [],
+            'screenshot_features': []  # New feature for local screenshot analysis
         }
         
         for html_file in html_files:
@@ -175,6 +124,13 @@ class EnhancedHTMLSimilarityAnalyzer:
                     above_fold = self._extract_above_fold_content(soup)
                     features['above_fold_content'].append(above_fold)
                     
+                    # Capture and analyze screenshot for visual features
+                    if self.capture_screenshots:
+                        screenshot_feature = self._extract_screenshot_features(file_path)
+                        features['screenshot_features'].append(screenshot_feature)
+                    else:
+                        features['screenshot_features'].append(None)
+                    
             except Exception as e:
                 print(f"Error processing {html_file}: {e}")
                 # Add empty features for failed files to maintain index alignment
@@ -186,19 +142,12 @@ class EnhancedHTMLSimilarityAnalyzer:
                 features['semantic_structures'].append({})
                 features['visual_fingerprints'].append([])
                 features['above_fold_content'].append("")
+                features['screenshot_features'].append(None)
         
         return features
     
     def _extract_visible_text(self, soup):
-        """
-        Extract visible text content from HTML, focusing on what a user would read.
-        
-        Args:
-            soup: BeautifulSoup object of HTML
-            
-        Returns:
-            Extracted visible text
-        """
+        """Extract visible text content from HTML"""
         # Remove script, style, and other non-visible elements
         for element in soup(['script', 'style', 'head', 'title', 'meta', '[document]']):
             element.extract()
@@ -214,15 +163,7 @@ class EnhancedHTMLSimilarityAnalyzer:
         return text
     
     def _get_dom_structure(self, soup):
-        """
-        Get DOM structure as a hierarchical dictionary.
-        
-        Args:
-            soup: BeautifulSoup object of HTML
-            
-        Returns:
-            Dictionary representing DOM structure
-        """
+        """Get DOM structure as a hierarchical dictionary"""
         def extract_structure(element):
             result = {'tag': element.name}
             
@@ -249,15 +190,7 @@ class EnhancedHTMLSimilarityAnalyzer:
         return {}
     
     def _get_tag_frequency(self, soup):
-        """
-        Get frequency of HTML tags in the document.
-        
-        Args:
-            soup: BeautifulSoup object of HTML
-            
-        Returns:
-            Dictionary of tag frequencies
-        """
+        """Get frequency of HTML tags in the document"""
         all_tags = soup.find_all(True)
         tag_counts = {}
         
@@ -271,16 +204,7 @@ class EnhancedHTMLSimilarityAnalyzer:
         return tag_counts
     
     def _extract_css_properties(self, soup, html_content):
-        """
-        Extract CSS properties that affect the visual appearance.
-        
-        Args:
-            soup: BeautifulSoup object of HTML
-            html_content: Raw HTML content
-            
-        Returns:
-            Dictionary of common CSS properties
-        """
+        """Extract CSS properties that affect the visual appearance"""
         css_props = {
             'fonts': [],
             'background_colors': [],
@@ -355,16 +279,7 @@ class EnhancedHTMLSimilarityAnalyzer:
         return css_props
     
     def _extract_color_scheme(self, soup, html_content):
-        """
-        Extract the color scheme of the document.
-        
-        Args:
-            soup: BeautifulSoup object of HTML
-            html_content: Raw HTML content
-            
-        Returns:
-            List of dominant colors as RGB tuples
-        """
+        """Extract the color scheme of the document"""
         # Collect all colors
         colors = []
         
@@ -426,15 +341,7 @@ class EnhancedHTMLSimilarityAnalyzer:
         return processed_colors
     
     def _extract_semantic_structure(self, soup):
-        """
-        Extract semantic structure using HTML5 semantic elements.
-        
-        Args:
-            soup: BeautifulSoup object of HTML
-            
-        Returns:
-            Dictionary of semantic elements and their content
-        """
+        """Extract semantic structure using HTML5 semantic elements"""
         semantic_tags = ['header', 'nav', 'main', 'article', 'section', 'aside', 'footer']
         semantic_structure = {}
         
@@ -464,84 +371,7 @@ class EnhancedHTMLSimilarityAnalyzer:
         return semantic_structure
     
     def _generate_visual_fingerprint(self, soup, html_content):
-        """
-        Generate a visual fingerprint of the document using a simplified rendering approach.
-        
-        Args:
-            soup: BeautifulSoup object of HTML
-            html_content: Raw HTML content
-            
-        Returns:
-            Visual fingerprint as a list
-        """
-        if self.render_screenshots:
-            # Use actual screenshots with Playwright
-            return self._generate_screenshot_fingerprint(html_content)
-        else:
-            # Fall back to a DOM-based visual fingerprint
-            return self._generate_dom_visual_fingerprint(soup)
-    
-    def _generate_screenshot_fingerprint(self, html_content):
-        """
-        Generate a fingerprint from an actual screenshot.
-        
-        Args:
-            html_content: HTML content to render
-            
-        Returns:
-            Visual fingerprint as a list
-        """
-        # Create a temporary HTML file
-        tmp_file = 'temp_screenshot.html'
-        with open(tmp_file, 'w', encoding='utf-8') as f:
-            f.write(html_content)
-        
-        # Get absolute path for the file URL
-        file_path = os.path.abspath(tmp_file)
-        file_url = f"file://{file_path}"
-        
-        # Create a new page
-        page = self.browser.new_page(viewport={"width": 1280, "height": 1024})
-        
-        # Load the page
-        page.goto(file_url)
-        page.wait_for_load_state("networkidle")
-        
-        # Take screenshot
-        screenshot_bytes = page.screenshot()
-        
-        # Close the page
-        page.close()
-        
-        # Clean up
-        os.remove(tmp_file)
-        
-        # Process screenshot
-        image = Image.open(BytesIO(screenshot_bytes))
-        # Resize to a smaller dimension for faster processing
-        image = image.resize((100, 100))
-        # Convert to grayscale
-        image = image.convert('L')
-        
-        # Get pixel data
-        pixels = list(image.getdata())
-        
-        # Simplify to a binary fingerprint (black vs white)
-        threshold = sum(pixels) / len(pixels)  # Average pixel value
-        fingerprint = [1 if pixel > threshold else 0 for pixel in pixels]
-        
-        return fingerprint
-    
-    def _generate_dom_visual_fingerprint(self, soup):
-        """
-        Generate a simplified visual fingerprint based on DOM structure.
-        
-        Args:
-            soup: BeautifulSoup object of HTML
-            
-        Returns:
-            Visual fingerprint as a list
-        """
+        """Generate a simplified visual fingerprint based on DOM structure"""
         # Create a simplified 10x10 grid representation of the page
         grid_size = 10
         grid = [[0 for _ in range(grid_size)] for _ in range(grid_size)]
@@ -612,15 +442,7 @@ class EnhancedHTMLSimilarityAnalyzer:
         return fingerprint
     
     def _extract_above_fold_content(self, soup):
-        """
-        Extract content likely to be visible above the fold (first screen).
-        
-        Args:
-            soup: BeautifulSoup object of HTML
-            
-        Returns:
-            Text content from the top of the page
-        """
+        """Extract content likely to be visible above the fold (first screen)"""
         above_fold = []
         
         # Headers are usually above the fold
@@ -650,57 +472,169 @@ class EnhancedHTMLSimilarityAnalyzer:
         # Join all content
         return ' '.join(above_fold)
     
+    def _extract_screenshot_features(self, html_path):
+        """
+        Extract visual features from a screenshot of the HTML file.
+        Uses perceptual hashing and other local image features instead of external API.
+        
+        Args:
+            html_path: Path to the HTML file
+            
+        Returns:
+            Dictionary of screenshot features or None if screenshot failed
+        """
+        try:
+            # Capture screenshot
+            screenshot = self._capture_screenshot(html_path)
+            if screenshot is None:
+                return None
+            
+            # Generate features from screenshot
+            features = {}
+            
+            # 1. Compute perceptual hashes
+            features['phash'] = str(imagehash.phash(screenshot))
+            features['dhash'] = str(imagehash.dhash(screenshot))
+            features['whash'] = str(imagehash.whash(screenshot))
+            
+            # 2. Convert to numpy array for OpenCV processing
+            img_array = np.array(screenshot)
+            if len(img_array.shape) == 3:  # Color image
+                img_gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+            else:  # Already grayscale
+                img_gray = img_array
+            
+            # 3. Calculate histograms
+            hist = cv2.calcHist([img_gray], [0], None, [32], [0, 256])
+            features['histogram'] = hist.flatten().tolist()
+            
+            # 4. Calculate image statistics
+            stat = ImageStat.Stat(screenshot)
+            features['mean'] = stat.mean
+            features['median'] = stat.median
+            features['stddev'] = stat.stddev
+            
+            # 5. Extract dominant colors (simplified)
+            if screenshot.mode == 'RGB':
+                # Resize to smaller image for faster processing
+                small_img = screenshot.resize((50, 50))
+                pixels = small_img.getdata()
+                colors = Counter(pixels)
+                top_colors = colors.most_common(5)
+                features['dominant_colors'] = [list(color[0]) for color in top_colors]
+            else:
+                features['dominant_colors'] = []
+            
+            # 6. Edge detection
+            edges = cv2.Canny(img_gray, 100, 200)
+            edge_points = np.sum(edges > 0)
+            features['edge_density'] = float(edge_points) / (edges.shape[0] * edges.shape[1])
+            
+            return features
+        
+        except Exception as e:
+            print(f"Error extracting screenshot features: {e}")
+            return None
+    
+    def _capture_screenshot(self, html_path):
+        """
+        Capture screenshot of an HTML file using Playwright.
+        
+        Args:
+            html_path: Path to the HTML file
+            
+        Returns:
+            PIL Image object or None if capture failed
+        """
+        if not self.capture_screenshots:
+            return None
+            
+        try:
+            # Get absolute path for file URL
+            file_path = os.path.abspath(html_path)
+            file_url = f"file://{file_path}"
+            
+            # Create a new page
+            page = self.browser.new_page(viewport={"width": 1280, "height": 1024})
+            
+            # Set a reasonable timeout
+            page.set_default_timeout(10000)  # 10 seconds
+            
+            # Load the page
+            page.goto(file_url)
+            page.wait_for_load_state("domcontentloaded")
+            
+            # Take screenshot
+            screenshot_bytes = page.screenshot()
+            
+            # Close the page
+            page.close()
+            
+            # Convert to PIL Image
+            image = Image.open(BytesIO(screenshot_bytes))
+            
+            return image
+        except Exception as e:
+            print(f"Error capturing screenshot for {html_path}: {e}")
+            return None
+    
     def compute_similarity_matrix(self, features):
         """
         Compute combined similarity matrix based on multiple feature types.
+        The method used depends on the analyzer's configuration.
         
         Args:
-            features: Dictionary of extracted features
+            features: Dictionary containing extracted features
             
         Returns:
             Combined similarity matrix
         """
-        print("Computing similarity matrix using multiple metrics...")
-        
-        # Content similarity
-        content_similarity = self._compute_text_similarity(features['text_contents'])
-        
-        # Structure similarity
-        structure_similarity = self._compute_structure_similarity(features['dom_structures'], features['tag_frequencies'])
-        
-        # Visual similarity
-        visual_similarity = self._compute_visual_similarity(
-            features['css_properties'], 
-            features['color_schemes'], 
-            features['visual_fingerprints']
-        )
-        
-        # Semantic similarity
-        semantic_similarity = self._compute_semantic_similarity(
-            features['semantic_structures'], 
-            features['above_fold_content']
-        )
-        
-        # Combine similarities with weights
-        combined_similarity = (
-            self.content_weight * content_similarity +
-            self.structure_weight * structure_similarity +
-            self.visual_weight * visual_similarity +
-            self.semantic_weight * semantic_similarity
-        )
-        
-        return combined_similarity
+        if self.method == "visual" and self.capture_screenshots:
+            # Use visual-only similarity based on screenshots
+            return self._compute_screenshot_similarity(features['screenshot_features'])
+        else:
+            # Use weighted combination of multiple similarity metrics
+            print("Computing similarity matrix using multiple metrics...")
+            
+            # Content similarity
+            content_similarity = self._compute_text_similarity(features['text_contents'])
+            
+            # Structure similarity
+            structure_similarity = self._compute_structure_similarity(features['dom_structures'], features['tag_frequencies'])
+            
+            # Visual similarity
+            if self.capture_screenshots:
+                # Use screenshot-based visual similarity if available
+                screenshot_similarity = self._compute_screenshot_similarity(features['screenshot_features'])
+                visual_similarity = 0.6 * screenshot_similarity + 0.4 * self._compute_visual_similarity(
+                    features['css_properties'], 
+                    features['color_schemes']
+                )
+            else:
+                # Fall back to CSS and color-based visual similarity
+                visual_similarity = self._compute_visual_similarity(
+                    features['css_properties'], 
+                    features['color_schemes']
+                )
+            
+            # Semantic similarity
+            semantic_similarity = self._compute_semantic_similarity(
+                features['semantic_structures'], 
+                features['above_fold_content']
+            )
+            
+            # Combine similarities with weights
+            combined_similarity = (
+                self.content_weight * content_similarity +
+                self.structure_weight * structure_similarity +
+                self.visual_weight * visual_similarity +
+                self.semantic_weight * semantic_similarity
+            )
+            
+            return combined_similarity
     
     def _compute_text_similarity(self, text_contents):
-        """
-        Compute similarity between text contents using TF-IDF.
-        
-        Args:
-            text_contents: List of text contents
-            
-        Returns:
-            Text similarity matrix
-        """
+        """Compute similarity between text contents using TF-IDF"""
         # Handle empty text contents
         if not text_contents or all(not text for text in text_contents):
             return np.zeros((len(text_contents), len(text_contents)))
@@ -717,16 +651,7 @@ class EnhancedHTMLSimilarityAnalyzer:
         return text_similarity
     
     def _compute_structure_similarity(self, dom_structures, tag_frequencies):
-        """
-        Compute similarity between documents based on DOM structure and tag frequencies.
-        
-        Args:
-            dom_structures: List of DOM structure dictionaries
-            tag_frequencies: List of tag frequency dictionaries
-            
-        Returns:
-            Structure similarity matrix
-        """
+        """Compute similarity between documents based on DOM structure and tag frequencies"""
         n = len(dom_structures)
         structure_similarity = np.zeros((n, n))
         
@@ -750,16 +675,7 @@ class EnhancedHTMLSimilarityAnalyzer:
         return structure_similarity
     
     def _compute_tag_frequency_similarity(self, tags1, tags2):
-        """
-        Compute similarity between tag frequency dictionaries.
-        
-        Args:
-            tags1: First tag frequency dictionary
-            tags2: Second tag frequency dictionary
-            
-        Returns:
-            Tag frequency similarity score
-        """
+        """Compute similarity between tag frequency dictionaries"""
         # If both dictionaries are empty, consider them similar
         if not tags1 and not tags2:
             return 1.0
@@ -786,17 +702,7 @@ class EnhancedHTMLSimilarityAnalyzer:
             return 0.0
     
     def _compute_dom_similarity(self, dom1, dom2):
-        """
-        Compute similarity between DOM structures.
-        
-        Args:
-            dom1: First DOM structure dictionary
-            dom2: Second DOM structure dictionary
-            
-        Returns:
-            DOM structure similarity score
-        """
-        # Compare DOM trees
+        """Compute similarity between DOM structures"""
         def compare_trees(tree1, tree2, depth=0):
             # Base similarity for matching tag
             if tree1['tag'] == tree2['tag']:
@@ -861,18 +767,8 @@ class EnhancedHTMLSimilarityAnalyzer:
         # Compare the DOM trees starting from the root
         return compare_trees(dom1, dom2)
     
-    def _compute_visual_similarity(self, css_properties, color_schemes, visual_fingerprints):
-        """
-        Compute visual similarity between documents.
-        
-        Args:
-            css_properties: List of CSS property dictionaries
-            color_schemes: List of color scheme lists
-            visual_fingerprints: List of visual fingerprints
-            
-        Returns:
-            Visual similarity matrix
-        """
+    def _compute_visual_similarity(self, css_properties, color_schemes):
+        """Compute visual similarity between documents based on CSS and colors"""
         n = len(css_properties)
         visual_similarity = np.zeros((n, n))
         
@@ -884,25 +780,84 @@ class EnhancedHTMLSimilarityAnalyzer:
                 # Color scheme similarity
                 color_sim = self._compute_color_similarity(color_schemes[i], color_schemes[j])
                 
-                # Visual fingerprint similarity
-                fingerprint_sim = self._compute_fingerprint_similarity(visual_fingerprints[i], visual_fingerprints[j])
-                
                 # Weighted combination
-                visual_similarity[i, j] = 0.3 * css_sim + 0.3 * color_sim + 0.4 * fingerprint_sim
+                visual_similarity[i, j] = 0.5 * css_sim + 0.5 * color_sim
         
         return visual_similarity
     
-    def _compute_css_similarity(self, css1, css2):
+    def _compute_screenshot_similarity(self, screenshot_features):
         """
-        Compute similarity between CSS properties.
+        Compute similarity between screenshots using local image features.
+        This is the alternative to using external APIs like Twelve Labs.
         
         Args:
-            css1: First CSS properties dictionary
-            css2: Second CSS properties dictionary
+            screenshot_features: List of screenshot feature dictionaries
             
         Returns:
-            CSS similarity score
+            Screenshot similarity matrix
         """
+        n = len(screenshot_features)
+        screenshot_similarity = np.ones((n, n))  # Default to identity matrix
+        
+        # Skip if no screenshot features available
+        valid_features = [f for f in screenshot_features if f is not None]
+        if not valid_features:
+            return screenshot_similarity
+        
+        for i in range(n):
+            for j in range(i+1, n):  # Only compute upper triangle (symmetric matrix)
+                # Skip if either screenshot has no features
+                if screenshot_features[i] is None or screenshot_features[j] is None:
+                    screenshot_similarity[i, j] = 0.0
+                    screenshot_similarity[j, i] = 0.0
+                    continue
+                
+                # Compute individual feature similarities
+                similarities = []
+                
+                # 1. Perceptual hash similarity
+                for hash_type in ['phash', 'dhash', 'whash']:
+                    hash1 = screenshot_features[i][hash_type]
+                    hash2 = screenshot_features[j][hash_type]
+                    # Hamming distance between hashes (normalized)
+                    hash_sim = 1.0 - sum(c1 != c2 for c1, c2 in zip(hash1, hash2)) / len(hash1)
+                    similarities.append((hash_sim, 0.4))  # Higher weight for perceptual hashes
+                
+                # 2. Histogram similarity
+                hist1 = np.array(screenshot_features[i]['histogram'])
+                hist2 = np.array(screenshot_features[j]['histogram'])
+                # Normalize histograms
+                hist1 = hist1 / np.sum(hist1) if np.sum(hist1) > 0 else hist1
+                hist2 = hist2 / np.sum(hist2) if np.sum(hist2) > 0 else hist2
+                # Histogram intersection
+                hist_sim = np.sum(np.minimum(hist1, hist2))
+                similarities.append((hist_sim, 0.2))
+                
+                # 3. Color similarity
+                if screenshot_features[i]['dominant_colors'] and screenshot_features[j]['dominant_colors']:
+                    # Compare top dominant colors
+                    color1 = np.array(screenshot_features[i]['dominant_colors'][0])
+                    color2 = np.array(screenshot_features[j]['dominant_colors'][0])
+                    # Color distance (normalized)
+                    color_dist = np.linalg.norm(color1 - color2) / (255 * np.sqrt(3))
+                    color_sim = 1.0 - color_dist
+                    similarities.append((color_sim, 0.2))
+                
+                # 4. Structure similarity (edge density)
+                edge_sim = 1.0 - abs(screenshot_features[i]['edge_density'] - screenshot_features[j]['edge_density'])
+                similarities.append((edge_sim, 0.2))
+                
+                # Compute weighted average similarity
+                total_weight = sum(weight for _, weight in similarities)
+                if total_weight > 0:
+                    avg_sim = sum(sim * weight for sim, weight in similarities) / total_weight
+                    screenshot_similarity[i, j] = avg_sim
+                    screenshot_similarity[j, i] = avg_sim  # Symmetric matrix
+                
+        return screenshot_similarity
+    
+    def _compute_css_similarity(self, css1, css2):
+        """Compute similarity between CSS properties"""
         if not css1 or not css2:
             return 0.0
         
@@ -951,16 +906,7 @@ class EnhancedHTMLSimilarityAnalyzer:
             return 0.0
     
     def _compute_color_similarity(self, colors1, colors2):
-        """
-        Compute similarity between color schemes.
-        
-        Args:
-            colors1: First list of colors
-            colors2: Second list of colors
-            
-        Returns:
-            Color similarity score
-        """
+        """Compute similarity between color schemes"""
         if not colors1 or not colors2:
             return 0.0
         
@@ -987,41 +933,8 @@ class EnhancedHTMLSimilarityAnalyzer:
         
         return color_similarity
     
-    def _compute_fingerprint_similarity(self, fp1, fp2):
-        """
-        Compute similarity between visual fingerprints.
-        
-        Args:
-            fp1: First visual fingerprint
-            fp2: Second visual fingerprint
-            
-        Returns:
-            Fingerprint similarity score
-        """
-        if not fp1 or not fp2 or len(fp1) != len(fp2):
-            return 0.0
-        
-        # Calculate Hamming similarity for binary fingerprints
-        if all(isinstance(x, int) and x in [0, 1] for x in fp1):
-            matching = sum(1 for a, b in zip(fp1, fp2) if a == b)
-            return matching / len(fp1)
-        else:
-            # Calculate Euclidean distance for non-binary fingerprints
-            distance = sum((a - b) ** 2 for a, b in zip(fp1, fp2)) ** 0.5
-            max_distance = (len(fp1) * 9) ** 0.5  # Maximum possible distance
-            return 1 - (distance / max_distance)
-    
     def _compute_semantic_similarity(self, semantic_structures, above_fold_contents):
-        """
-        Compute semantic similarity between documents.
-        
-        Args:
-            semantic_structures: List of semantic structure dictionaries
-            above_fold_contents: List of above-fold content texts
-            
-        Returns:
-            Semantic similarity matrix
-        """
+        """Compute semantic similarity between documents"""
         n = len(semantic_structures)
         semantic_similarity = np.zeros((n, n))
         
@@ -1046,16 +959,7 @@ class EnhancedHTMLSimilarityAnalyzer:
         return semantic_similarity
     
     def _compute_semantic_structure_similarity(self, struct1, struct2):
-        """
-        Compute similarity between semantic structures.
-        
-        Args:
-            struct1: First semantic structure dictionary
-            struct2: Second semantic structure dictionary
-            
-        Returns:
-            Semantic structure similarity score
-        """
+        """Compute similarity between semantic structures"""
         if not struct1 and not struct2:
             return 1.0
         
@@ -1109,16 +1013,7 @@ class EnhancedHTMLSimilarityAnalyzer:
             return 0.0
     
     def _compute_text_fold_similarity(self, text1, text2):
-        """
-        Compute similarity between above-fold content texts.
-        
-        Args:
-            text1: First above-fold content text
-            text2: Second above-fold content text
-            
-        Returns:
-            Text similarity score
-        """
+        """Compute similarity between above-fold content texts"""
         if not text1 and not text2:
             return 1.0
         
@@ -1132,16 +1027,7 @@ class EnhancedHTMLSimilarityAnalyzer:
         return similarity
     
     def group_similar_documents(self, similarity_matrix, file_names):
-        """
-        Group similar documents based on similarity matrix.
-        
-        Args:
-            similarity_matrix: Matrix of similarity scores
-            file_names: List of file names
-            
-        Returns:
-            List of lists containing grouped document names
-        """
+        """Group similar documents based on similarity matrix"""
         print(f"Grouping documents with similarity threshold {self.threshold}...")
         
         n = len(file_names)
@@ -1166,14 +1052,7 @@ class EnhancedHTMLSimilarityAnalyzer:
         return grouped
     
     def visualize_similarity_matrix(self, similarity_matrix, file_names, output_path=None):
-        """
-        Visualize the similarity matrix as a heatmap.
-        
-        Args:
-            similarity_matrix: Matrix of similarity scores
-            file_names: List of file names
-            output_path: Path to save the visualization (optional)
-        """
+        """Visualize the similarity matrix as a heatmap"""
         plt.figure(figsize=(12, 10))
         plt.imshow(similarity_matrix, cmap='viridis', interpolation='nearest')
         plt.colorbar(label='Similarity')
@@ -1192,15 +1071,7 @@ class EnhancedHTMLSimilarityAnalyzer:
             plt.show()
     
     def analyze_directory(self, directory):
-        """
-        Analyze all HTML files in a directory and group similar documents.
-        
-        Args:
-            directory: Directory containing HTML files
-            
-        Returns:
-            List of lists containing grouped document names, similarity matrix, and file names
-        """
+        """Analyze all HTML files in a directory and group similar documents"""
         # Get all HTML files in the directory
         html_files = [f for f in os.listdir(directory) if f.endswith('.html')]
         
@@ -1222,326 +1093,18 @@ class EnhancedHTMLSimilarityAnalyzer:
         return groups, similarity_matrix, html_files
     
     def cleanup(self):
-        """Close Playwright resources if initialized."""
-        if self.render_screenshots:
-            self.browser.close()
-            self.playwright.stop()
-
-
-class ScreenshotSimilarityAnalyzer:
-    """
-    Analyze HTML similarity by comparing screenshots using the Twelve Labs image embedding API.
-    """
-    
-    def __init__(self, api_key, threshold=0.75):
-        """
-        Initialize the analyzer with Twelve Labs API access and similarity threshold.
-        
-        Args:
-            api_key: Twelve Labs API key
-            threshold: Similarity threshold for grouping documents (default: 0.75)
-        """
-        self.api_key = api_key
-        self.threshold = threshold
-        self.twelvelabs_client = TwelveLabs(api_key=api_key)
-        self._init_browser()
-    
-    def _init_browser(self):
-        """Initialize Playwright for taking screenshots."""
-        self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(headless=True)
-    
-    def capture_screenshot(self, html_path):
-        """
-        Capture screenshot of an HTML file using Playwright.
-        
-        Args:
-            html_path: Path to the HTML file
-            
-        Returns:
-            PIL Image object
-        """
-        try:
-            # Get absolute path for file URL
-            file_path = os.path.abspath(html_path)
-            file_url = f"file://{file_path}"
-            
-            # Create a new page
-            page = self.browser.new_page(viewport={"width": 1280, "height": 1024})
-            
-            # Load the page
-            page.goto(file_url)
-            page.wait_for_load_state("networkidle")
-            
-            # Take screenshot
-            screenshot_bytes = page.screenshot()
-            
-            # Close the page
-            page.close()
-            
-            # Convert to PIL Image
-            image = Image.open(BytesIO(screenshot_bytes))
-            
-            return image
-        except Exception as e:
-            print(f"Error capturing screenshot for {html_path}: {e}")
-            return None
-    
-    def get_image_embedding(self, image):
-        """
-        Get embedding for an image using Twelve Labs API.
-        
-        Args:
-            image: PIL Image object
-            
-        Returns:
-            Embedding vector
-        """
-        try:
-            # Convert image to base64 string
-            buffered = BytesIO()
-            image.save(buffered, format="JPEG")
-            img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-            
-            # Generate embedding using Twelve Labs API
-            response = self.twelvelabs_client.embed.create(
-                model_name="Marengo-retrieval-2.7",
-                image_base64=img_base64
-            )
-            
-            # Extract the embedding vector
-            embedding = response.image_embedding.segments.embeddings_float
-            
-            return embedding
-        except Exception as e:
-            print(f"Error getting image embedding: {e}")
-            return None
-    
-    def analyze_directory(self, directory):
-        """
-        Analyze all HTML files in a directory and group similar documents.
-        
-        Args:
-            directory: Directory containing HTML files
-            
-        Returns:
-            List of lists containing grouped document names, similarity matrix, and file names
-        """
-        # Get all HTML files in the directory
-        html_files = [f for f in os.listdir(directory) if f.endswith('.html')]
-        
-        if not html_files:
-            print(f"No HTML files found in {directory}")
-            return [], None, []
-        
-        print(f"Found {len(html_files)} HTML files in {directory}")
-        
-        # Get embeddings for all HTML files
-        print("Capturing screenshots and generating embeddings...")
-        embeddings = []
-        valid_files = []
-        
-        for html_file in html_files:
-            html_path = os.path.join(directory, html_file)
-            print(f"Processing {html_file}...")
-            
-            # Capture screenshot
-            screenshot = self.capture_screenshot(html_path)
-            
-            if screenshot:
-                # Get embedding
-                embedding = self.get_image_embedding(screenshot)
-                
-                if embedding:
-                    embeddings.append(embedding)
-                    valid_files.append(html_file)
-                else:
-                    print(f"Failed to get embedding for {html_file}")
-            else:
-                print(f"Failed to capture screenshot for {html_file}")
-        
-        if not embeddings:
-            print("No valid embeddings generated")
-            return [], None, []
-        
-        # Compute similarity matrix
-        print("Computing similarity matrix...")
-        embeddings_array = np.array(embeddings)
-        similarity_matrix = cosine_similarity(embeddings_array)
-        
-        # Group similar documents
-        print(f"Grouping documents with similarity threshold {self.threshold}...")
-        grouped = self._group_similar_documents(similarity_matrix, valid_files)
-        
-        return grouped, similarity_matrix, valid_files
-    
-    def _group_similar_documents(self, similarity_matrix, file_names):
-        """
-        Group similar documents based on similarity matrix.
-        
-        Args:
-            similarity_matrix: Matrix of similarity scores
-            file_names: List of file names
-            
-        Returns:
-            List of lists containing grouped document names
-        """
-        n = len(file_names)
-        grouped = []
-        processed = set()
-        
-        for i in range(n):
-            if i in processed:
-                continue
-            
-            group = [file_names[i]]
-            processed.add(i)
-            
-            for j in range(i+1, n):
-                if j not in processed and similarity_matrix[i, j] >= self.threshold:
-                    group.append(file_names[j])
-                    processed.add(j)
-            
-            grouped.append(group)
-        
-        print(f"Found {len(grouped)} groups of similar documents.")
-        return grouped
-    
-    def cleanup(self):
-        """Close Playwright resources."""
-        if hasattr(self, 'browser'):
-            self.browser.close()
-        if hasattr(self, 'playwright'):
-            self.playwright.stop()
-
-
-class HtmlSimilarityOrchestrator:
-    """
-    Orchestrate multiple HTML similarity analysis approaches.
-    """
-    
-    def __init__(self, method="hybrid", twelve_labs_api_key=None, **kwargs):
-        """
-        Initialize the orchestrator with the desired method.
-        
-        Args:
-            method: Analysis method to use - "weighted", "visual", or "hybrid" (default: "hybrid")
-            twelve_labs_api_key: API key for Twelve Labs (required for "visual" and "hybrid" methods)
-            **kwargs: Additional arguments to pass to analyzers
-        """
-        self.method = method
-        
-        # Initialize analyzers based on method
-        if method == "weighted" or method == "hybrid":
-            self.weighted_analyzer = EnhancedHTMLSimilarityAnalyzer(**kwargs)
-        
-        if method == "visual" or method == "hybrid":
-            if not twelve_labs_api_key:
-                raise ValueError("Twelve Labs API key is required for visual or hybrid analysis")
-            self.visual_analyzer = ScreenshotSimilarityAnalyzer(
-                api_key=twelve_labs_api_key,
-                threshold=kwargs.get("threshold", 0.75)
-            )
-    
-    def analyze_directory(self, directory):
-        """
-        Analyze all HTML files in a directory using the selected method.
-        
-        Args:
-            directory: Directory containing HTML files
-            
-        Returns:
-            List of lists containing grouped document names, similarity matrix, and file names
-        """
-        if self.method == "weighted":
-            return self.weighted_analyzer.analyze_directory(directory)
-        
-        elif self.method == "visual":
-            return self.visual_analyzer.analyze_directory(directory)
-        
-        else:  # hybrid
-            # Run both analysis methods
-            print("\n=== Running weighted analysis ===")
-            weighted_groups, weighted_matrix, weighted_files = self.weighted_analyzer.analyze_directory(directory)
-            
-            print("\n=== Running visual screenshot-based analysis ===")
-            visual_groups, visual_matrix, visual_files = self.visual_analyzer.analyze_directory(directory)
-            
-            # Combine results
-            print("\n=== Combining results from both methods ===")
-            combined_groups = self._combine_groups(weighted_groups, visual_groups)
-            
-            return combined_groups, None, weighted_files
-    
-    def _combine_groups(self, weighted_groups, visual_groups):
-        """
-        Combine grouping results from multiple analysis methods.
-        
-        Args:
-            weighted_groups: Groups from weighted analysis
-            visual_groups: Groups from visual analysis
-            
-        Returns:
-            Combined groups
-        """
-        # Start with visual groups as the base
-        combined = visual_groups.copy()
-        
-        # For each weighted group
-        for w_group in weighted_groups:
-            # If all files in this group exist in the same visual group, skip
-            if self._group_exists_in(w_group, combined):
-                continue
-            
-            # Otherwise, look for partial matches and enhance
-            matched = False
-            for c_group in combined:
-                if self._groups_overlap(w_group, c_group):
-                    # If there's significant overlap, merge non-overlapping elements
-                    for file in w_group:
-                        if file not in c_group:
-                            c_group.append(file)
-                    matched = True
-            
-            # If no match found at all, add as a new group
-            if not matched and w_group:
-                combined.append(w_group)
-        
-        return combined
-    
-    def _group_exists_in(self, group, group_list):
-        """Check if all elements of a group exist in any single group in the list."""
-        for g in group_list:
-            if all(item in g for item in group):
-                return True
-        return False
-    
-    def _groups_overlap(self, group1, group2, threshold=0.5):
-        """Check if two groups have significant overlap."""
-        if not group1 or not group2:
-            return False
-            
-        common = [item for item in group1 if item in group2]
-        return len(common) / min(len(group1), len(group2)) >= threshold
-    
-    def cleanup(self):
         """Clean up resources."""
-        if hasattr(self, 'weighted_analyzer'):
-            self.weighted_analyzer.cleanup()
-        
-        if hasattr(self, 'visual_analyzer'):
-            self.visual_analyzer.cleanup()
+        if self.capture_screenshots:
+            self.browser.close()
+            self.playwright.stop()
 
 
 def main():
-    """
-    Main function to run the orchestrated HTML similarity analyzer.
-    """
+    """Main function to run the HTML similarity analyzer"""
     parser = argparse.ArgumentParser(description='Group similar HTML documents using multiple approaches')
     parser.add_argument('directory', help='Directory containing HTML files')
-    parser.add_argument('--method', choices=['weighted', 'visual', 'hybrid'], default='hybrid',
-                        help='Analysis method to use (default: hybrid)')
-    parser.add_argument('--api-key', help='Twelve Labs API key (required for visual and hybrid methods)')
+    parser.add_argument('--method', choices=['weighted', 'visual', 'hybrid'], default='weighted',
+                        help='Analysis method to use (default: weighted)')
     parser.add_argument('--content-weight', type=float, default=0.3,
                         help='Weight for content-based similarity (default: 0.3)')
     parser.add_argument('--structure-weight', type=float, default=0.2,
@@ -1552,28 +1115,23 @@ def main():
                         help='Weight for semantic element similarity (default: 0.1)')
     parser.add_argument('--threshold', type=float, default=0.75,
                         help='Similarity threshold for grouping documents (default: 0.75)')
-    parser.add_argument('--render-screenshots', action='store_true',
-                        help='Render actual screenshots for visual comparison in weighted analysis')
+    parser.add_argument('--capture-screenshots', action='store_true',
+                        help='Enable screenshot capturing for visual comparison')
     parser.add_argument('--visualize', action='store_true',
                         help='Visualize similarity matrix')
     parser.add_argument('--output', help='Output JSON file path')
     
     args = parser.parse_args()
     
-    # Check if API key is provided for visual or hybrid methods
-    if args.method in ['visual', 'hybrid'] and not args.api_key:
-        parser.error("Twelve Labs API key is required for visual or hybrid analysis")
-    
-    # Create orchestrator
-    orchestrator = HtmlSimilarityOrchestrator(
-        method=args.method,
-        twelve_labs_api_key=args.api_key,
+    # Create analyzer
+    analyzer = HTMLSimilarityAnalyzer(
         content_weight=args.content_weight,
         structure_weight=args.structure_weight,
         visual_weight=args.visual_weight,
         semantic_weight=args.semantic_weight,
         threshold=args.threshold,
-        render_screenshots=args.render_screenshots
+        method=args.method,
+        capture_screenshots=args.capture_screenshots
     )
     
     try:
@@ -1587,7 +1145,7 @@ def main():
             
             for subdir in subdirs:
                 print(f"\nProcessing subdirectory: {subdir}")
-                groups, similarity_matrix, html_files = orchestrator.analyze_directory(subdir)
+                groups, similarity_matrix, html_files = analyzer.analyze_directory(subdir)
                 
                 print(f"Results for {subdir}:")
                 for i, group in enumerate(groups):
@@ -1595,15 +1153,14 @@ def main():
                 
                 all_results[subdir.name] = [group for group in groups]
                 
-                if args.visualize and similarity_matrix is not None and args.method != "hybrid":
+                if args.visualize and similarity_matrix is not None:
                     output_path = None
                     if args.output:
                         vis_dir = Path(args.output).parent / 'visualizations'
                         os.makedirs(vis_dir, exist_ok=True)
                         output_path = vis_dir / f"{subdir.name}_{args.method}_similarity.png"
                     
-                    if args.method == "weighted":
-                        orchestrator.weighted_analyzer.visualize_similarity_matrix(similarity_matrix, html_files, output_path)
+                    analyzer.visualize_similarity_matrix(similarity_matrix, html_files, output_path)
             
             # Save results to JSON if output is specified
             if args.output:
@@ -1613,21 +1170,20 @@ def main():
         
         else:
             # Process the directory directly
-            groups, similarity_matrix, html_files = orchestrator.analyze_directory(args.directory)
+            groups, similarity_matrix, html_files = analyzer.analyze_directory(args.directory)
             
             print("\nFinal results:")
             for i, group in enumerate(groups):
                 print(f"Group {i+1}: {group}")
             
-            if args.visualize and similarity_matrix is not None and args.method != "hybrid":
+            if args.visualize and similarity_matrix is not None:
                 output_path = None
                 if args.output:
                     vis_dir = Path(args.output).parent / 'visualizations'
                     os.makedirs(vis_dir, exist_ok=True)
                     output_path = vis_dir / f"{args.method}_similarity.png"
                 
-                if args.method == "weighted":
-                    orchestrator.weighted_analyzer.visualize_similarity_matrix(similarity_matrix, html_files, output_path)
+                analyzer.visualize_similarity_matrix(similarity_matrix, html_files, output_path)
             
             # Save results to JSON if output is specified
             if args.output:
@@ -1636,8 +1192,8 @@ def main():
                 print(f"Results saved to {args.output}")
     
     finally:
-        # Cleanup
-        orchestrator.cleanup()
+        # Clean up resources
+        analyzer.cleanup()
 
 
 if __name__ == "__main__":
